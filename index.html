@@ -430,8 +430,41 @@ input, textarea { font: inherit; color: inherit; background: none; border: none;
 }
 
 .send-btn:disabled { opacity: .3; cursor: default; }
+.send-btn.stop { background: var(--coral); }
 
 .send-btn svg { width: 18px; height: 18px; fill: var(--bg); }
+
+.stop-icon { width: 14px; height: 14px; background: var(--bg); border-radius: 3px; }
+
+/* ── Typing Indicator ── */
+.typing-indicator { display: flex; gap: 5px; padding: 4px 0; }
+.typing-indicator span {
+  width: 7px; height: 7px;
+  background: var(--text-muted);
+  border-radius: 50%;
+  animation: typingBounce .9s infinite;
+}
+.typing-indicator span:nth-child(2) { animation-delay: .15s; }
+.typing-indicator span:nth-child(3) { animation-delay: .3s; }
+@keyframes typingBounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: .4; }
+  30% { transform: translateY(-5px); opacity: 1; }
+}
+
+/* ── Model Tag ── */
+.msg-model-tag {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 6px;
+  padding-left: 2px;
+}
+
+/* ── Error Message ── */
+.msg.error .msg-bubble {
+  background: rgba(249,112,102,.08);
+  border: 1px solid rgba(249,112,102,.25);
+  color: var(--coral);
+}
 
 /* ── Modal ── */
 .modal-overlay {
@@ -742,9 +775,26 @@ input, textarea { font: inherit; color: inherit; background: none; border: none;
 <script>
 // ── State ──
 let healthData = [];
-let chatMessages = [];
+let chatMessages = [];       // { role: 'user'|'assistant', content }
+let conversationHistory = []; // sent to API: { role, content }
 let connectionMode = 'local';
 let uploadedFileContent = null;
+let currentAbort = null;
+let isStreaming = false;
+
+const SYSTEM_PROMPT = `You are Health Intel, an expert health data analyst and medical information assistant. You help users understand their lab results, doctor's notes, and health metrics.
+
+Your approach:
+- Analyze health data thoroughly and identify patterns, concerns, and positive findings
+- Explain medical terminology in plain language
+- Flag values outside normal ranges and explain their significance
+- Provide actionable insights and lifestyle recommendations
+- Compare results to optimal ranges, not just "normal" ranges
+- Be honest about concerning findings while remaining calm and supportive
+- Always recommend consulting a healthcare provider for medical decisions
+- When multiple data sources are available, cross-reference them for a holistic view
+
+Important: You are an AI assistant providing health information for educational purposes. You are NOT a doctor. Always recommend professional medical consultation for diagnosis and treatment decisions.`;
 
 // ── DOM refs ──
 const $ = s => document.querySelector(s);
@@ -811,7 +861,7 @@ function renderData() {
   });
 
   dataList.querySelectorAll('.data-item-delete').forEach(btn => {
-    btn.addEventListener('click', e => {
+    btn.addEventListener('click', () => {
       healthData = healthData.filter(d => d.id !== btn.dataset.id);
       renderData();
     });
@@ -914,41 +964,331 @@ $('#modalSave').addEventListener('click', () => {
   closeModal();
 });
 
-// ── Chat ──
+// ── Auto-scroll logic ──
+function isNearBottom() {
+  return chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < 80;
+}
+
+function scrollToBottom() {
+  chatArea.scrollTop = chatArea.scrollHeight;
+}
+
+// ── Build system prompt with health data ──
+function buildSystemPrompt() {
+  let prompt = SYSTEM_PROMPT;
+  if (healthData.length > 0) {
+    prompt += '\n\nThe user has provided the following health data for analysis:\n';
+    healthData.forEach(d => {
+      prompt += `\n${'─'.repeat(40)}\nHEALTH DATA: ${d.label}\n${'─'.repeat(40)}\n${d.content}\n`;
+    });
+  }
+  return prompt;
+}
+
+// ── Get current model name for display ──
+function getCurrentModelName() {
+  if (connectionMode === 'local') {
+    return $('#modelName').value.trim() || 'local model';
+  }
+  return 'claude-sonnet-4-20250514';
+}
+
+// ── Render a single message DOM node ──
+function createMsgEl(role, content, modelName) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  const avatarLetter = role === 'user' ? 'Y' : 'H';
+  const bubbleContent = role === 'error' ? content : escHtml(content);
+  div.innerHTML = `
+    <div class="msg-avatar">${avatarLetter}</div>
+    <div>
+      <div class="msg-bubble">${bubbleContent}</div>
+      ${role === 'ai' && modelName ? `<div class="msg-model-tag">${escHtml(modelName)}</div>` : ''}
+    </div>
+  `;
+  return div;
+}
+
+// ── Render all messages from scratch ──
+function renderMessages() {
+  const wasNear = isNearBottom();
+  chatArea.innerHTML = '';
+  chatMessages.forEach(m => {
+    chatArea.appendChild(createMsgEl(m.role, m.content, m.model));
+  });
+  if (wasNear) scrollToBottom();
+}
+
+// ── Show chat view ──
 function showChat() {
   emptyState.style.display = 'none';
   chatArea.style.display = 'flex';
 }
 
-function renderMessages() {
-  chatArea.innerHTML = '';
-  chatMessages.forEach(m => {
-    const div = document.createElement('div');
-    div.className = `msg ${m.role}`;
-    div.innerHTML = `
-      <div class="msg-avatar">${m.role === 'user' ? 'Y' : 'H'}</div>
-      <div class="msg-bubble">${escHtml(m.content)}</div>
-    `;
-    chatArea.appendChild(div);
-  });
-  chatArea.scrollTop = chatArea.scrollHeight;
+// ── Update send button state ──
+function setSendButtonStreaming(streaming) {
+  isStreaming = streaming;
+  if (streaming) {
+    sendBtn.disabled = false;
+    sendBtn.classList.add('stop');
+    sendBtn.innerHTML = '<div class="stop-icon"></div>';
+  } else {
+    sendBtn.classList.remove('stop');
+    sendBtn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>';
+    sendBtn.disabled = !chatInput.value.trim();
+  }
 }
 
-function sendMessage(text) {
+// ── Add typing indicator ──
+function addTypingIndicator() {
+  const div = document.createElement('div');
+  div.className = 'msg ai';
+  div.id = 'typingMsg';
+  div.innerHTML = `
+    <div class="msg-avatar">H</div>
+    <div>
+      <div class="msg-bubble">
+        <div class="typing-indicator"><span></span><span></span><span></span></div>
+      </div>
+    </div>
+  `;
+  chatArea.appendChild(div);
+  scrollToBottom();
+}
+
+// ── Remove typing indicator and create streaming bubble ──
+function replaceTypingWithStream(modelName) {
+  const typing = $('#typingMsg');
+  if (typing) typing.remove();
+  const div = document.createElement('div');
+  div.className = 'msg ai';
+  div.id = 'streamingMsg';
+  div.innerHTML = `
+    <div class="msg-avatar">H</div>
+    <div>
+      <div class="msg-bubble" id="streamBubble"></div>
+      <div class="msg-model-tag">${escHtml(modelName)}</div>
+    </div>
+  `;
+  chatArea.appendChild(div);
+  return $('#streamBubble');
+}
+
+// ── Add error message to chat ──
+function addErrorMessage(errorText) {
+  const div = document.createElement('div');
+  div.className = 'msg ai error';
+  div.innerHTML = `
+    <div class="msg-avatar">H</div>
+    <div><div class="msg-bubble">${escHtml(errorText)}</div></div>
+  `;
+  chatArea.appendChild(div);
+  scrollToBottom();
+}
+
+// ── Update connection status dot ──
+function setStatus(mode, connected) {
+  const dotId = mode === 'local' ? '#localStatus' : '#cloudStatus';
+  const dot = $(dotId);
+  const textEl = dot.parentElement.querySelector('.status-text');
+  if (connected === true) {
+    dot.classList.add('connected');
+    textEl.textContent = 'Connected';
+  } else if (connected === false) {
+    dot.classList.remove('connected');
+    textEl.textContent = 'Error';
+  } else {
+    dot.classList.remove('connected');
+    textEl.textContent = 'Not connected';
+  }
+}
+
+// ── Parse SSE stream ──
+async function* parseSSE(reader) {
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (trimmed.startsWith('data: ')) {
+        const data = trimmed.slice(6);
+        if (data === '[DONE]') return;
+        try { yield JSON.parse(data); } catch {}
+      }
+    }
+  }
+}
+
+// ── Stream from Local (OpenAI-compatible) ──
+async function streamLocal(signal) {
+  const baseUrl = $('#baseUrl').value.trim();
+  const modelName = $('#modelName').value.trim();
+  const temp = parseFloat($('#localTemp').value);
+
+  const messages = [
+    { role: 'system', content: buildSystemPrompt() },
+    ...conversationHistory
+  ];
+
+  const res = await fetch(baseUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: modelName, messages, temperature: temp, stream: true }),
+    signal
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Local API error ${res.status}: ${body || res.statusText}`);
+  }
+
+  setStatus('local', true);
+  const reader = res.body.getReader();
+  let fullText = '';
+  const bubble = replaceTypingWithStream(modelName || 'local model');
+  const wasNear = isNearBottom();
+
+  for await (const chunk of parseSSE(reader)) {
+    const delta = chunk.choices?.[0]?.delta?.content;
+    if (delta) {
+      fullText += delta;
+      bubble.textContent = fullText;
+      if (wasNear || isNearBottom()) scrollToBottom();
+    }
+  }
+
+  return fullText;
+}
+
+// ── Stream from Cloud (Anthropic) ──
+async function streamCloud(signal) {
+  const apiKey = $('#apiKey').value.trim();
+  const temp = parseFloat($('#cloudTemp').value);
+  const modelName = 'claude-sonnet-4-20250514';
+
+  if (!apiKey) throw new Error('Please enter your Anthropic API key in the sidebar.');
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: JSON.stringify({
+      model: modelName,
+      system: buildSystemPrompt(),
+      messages: conversationHistory,
+      max_tokens: 8192,
+      temperature: temp,
+      stream: true
+    }),
+    signal
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`Anthropic API error ${res.status}: ${body || res.statusText}`);
+  }
+
+  setStatus('cloud', true);
+  const reader = res.body.getReader();
+  let fullText = '';
+  const bubble = replaceTypingWithStream(modelName);
+  const wasNear = isNearBottom();
+
+  for await (const chunk of parseSSE(reader)) {
+    if (chunk.type === 'content_block_delta') {
+      const delta = chunk.delta?.text;
+      if (delta) {
+        fullText += delta;
+        bubble.textContent = fullText;
+        if (wasNear || isNearBottom()) scrollToBottom();
+      }
+    }
+  }
+
+  return fullText;
+}
+
+// ── Send message ──
+async function sendMessage(text) {
   text = text.trim();
   if (!text) return;
+
+  // If currently streaming, abort instead
+  if (isStreaming && currentAbort) {
+    currentAbort.abort();
+    return;
+  }
+
+  // Add user message
   chatMessages.push({ role: 'user', content: text });
+  conversationHistory.push({ role: 'user', content: text });
   showChat();
   renderMessages();
   chatInput.value = '';
   autoGrow();
-  sendBtn.disabled = true;
+  scrollToBottom();
 
-  // Placeholder AI response
-  setTimeout(() => {
-    chatMessages.push({ role: 'ai', content: 'AI integration is not yet connected. Configure your connection in the sidebar and this will respond with real analysis.' });
+  // Show typing indicator
+  addTypingIndicator();
+  setSendButtonStreaming(true);
+  chatInput.disabled = true;
+
+  const modelName = getCurrentModelName();
+  currentAbort = new AbortController();
+
+  try {
+    let fullText;
+    if (connectionMode === 'local') {
+      fullText = await streamLocal(currentAbort.signal);
+    } else {
+      fullText = await streamCloud(currentAbort.signal);
+    }
+
+    // Finalize: remove streaming element, store message
+    const streamEl = $('#streamingMsg');
+    if (streamEl) streamEl.remove();
+
+    if (fullText) {
+      chatMessages.push({ role: 'ai', content: fullText, model: modelName });
+      conversationHistory.push({ role: 'assistant', content: fullText });
+    }
     renderMessages();
-  }, 400);
+
+  } catch (err) {
+    // Remove typing/streaming indicators
+    const typing = $('#typingMsg');
+    if (typing) typing.remove();
+    const streamEl = $('#streamingMsg');
+    if (streamEl) streamEl.remove();
+
+    if (err.name === 'AbortError') {
+      // Collect whatever was streamed before abort
+      const bubble = streamEl?.querySelector('.msg-bubble');
+      const partial = bubble?.textContent || '';
+      if (partial) {
+        chatMessages.push({ role: 'ai', content: partial, model: modelName + ' (stopped)' });
+        conversationHistory.push({ role: 'assistant', content: partial });
+        renderMessages();
+      }
+    } else {
+      setStatus(connectionMode, false);
+      addErrorMessage(err.message);
+    }
+  } finally {
+    currentAbort = null;
+    setSendButtonStreaming(false);
+    chatInput.disabled = false;
+    chatInput.focus();
+  }
 }
 
 // Prompt cards
@@ -956,18 +1296,25 @@ document.querySelectorAll('.prompt-card').forEach(card => {
   card.addEventListener('click', () => sendMessage(card.textContent));
 });
 
-// Send button
-sendBtn.addEventListener('click', () => sendMessage(chatInput.value));
+// Send button — send or stop
+sendBtn.addEventListener('click', () => {
+  if (isStreaming && currentAbort) {
+    currentAbort.abort();
+  } else {
+    sendMessage(chatInput.value);
+  }
+});
 
 // Input handling
 chatInput.addEventListener('input', () => {
-  sendBtn.disabled = !chatInput.value.trim();
+  if (!isStreaming) sendBtn.disabled = !chatInput.value.trim();
   autoGrow();
 });
 
 chatInput.addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
+    if (isStreaming) return;
     sendMessage(chatInput.value);
   }
 });
@@ -980,7 +1327,11 @@ function autoGrow() {
 // ── Export / Clear ──
 $('#exportChatBtn').addEventListener('click', () => {
   if (!chatMessages.length) return;
-  const text = chatMessages.map(m => `[${m.role.toUpperCase()}]\n${m.content}`).join('\n\n---\n\n');
+  const text = chatMessages.map(m => {
+    const label = m.role === 'user' ? 'USER' : 'ASSISTANT';
+    const meta = m.model ? ` [${m.model}]` : '';
+    return `[${label}${meta}]\n${m.content}`;
+  }).join('\n\n---\n\n');
   const blob = new Blob([text], { type: 'text/plain' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -990,7 +1341,9 @@ $('#exportChatBtn').addEventListener('click', () => {
 });
 
 $('#clearChatBtn').addEventListener('click', () => {
+  if (isStreaming && currentAbort) currentAbort.abort();
   chatMessages = [];
+  conversationHistory = [];
   chatArea.innerHTML = '';
   chatArea.style.display = 'none';
   emptyState.style.display = '';
